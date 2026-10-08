@@ -1,5 +1,13 @@
 > ROS2 Fork repo maintainer: [Ericsiii](https://github.com/Ericsii)
 
+## 本分支输出目录
+
+- 通过 ROS 参数 `output_directory` 指定日志和自动保存点云的绝对目录, 不使用源码目录. 默认使用 `$HOME/.local/share/fast_lio`.
+- 仅在 `runtime_pos_log_enable=true` 时创建 `output_directory/Log` 并打开诊断文件; 文件无法打开时明确报错.
+- 仅在 `pcd_save.pcd_save_en=true` 时创建 `output_directory/PCD`. 显式 `map_file_path` 必须是绝对文件路径; 未设置时使用 `output_directory/PCD/map.pcd`.
+- 调用 `map_save` 前启用 `publish.map_en` 并采集点云. 空地图或写入失败返回 `success=false`, 不报告虚假保存成功.
+- 每次采集使用独立输出目录, 避免覆盖旧结果. 本分支未改变 LiDAR-IMU 外参和输入话题语义.
+
 ## Related Works and Extended Application
 
 **SLAM:**

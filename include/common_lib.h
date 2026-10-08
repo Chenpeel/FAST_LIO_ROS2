@@ -1,6 +1,8 @@
 #ifndef COMMON_LIB_H
 #define COMMON_LIB_H
 
+#include <string>
+#include <stdexcept>
 #include <so3_math.h>
 #include <Eigen/Eigen>
 #include <pcl/point_types.h>
@@ -29,7 +31,9 @@ using namespace Eigen;
 #define CONSTRAIN(v,min,max)     ((v>min)?((v<max)?v:max):min)
 #define ARRAY_FROM_EIGEN(mat)    mat.data(), mat.data() + mat.rows() * mat.cols()
 #define STD_VEC_FROM_EIGEN(mat)  vector<decltype(mat)::Scalar> (mat.data(), mat.data() + mat.rows() * mat.cols())
-#define DEBUG_FILE_DIR(name)     (string(string(ROOT_DIR) + "Log/"+ name))
+extern std::string runtime_output_directory;
+extern bool runtime_pos_log;
+#define DEBUG_FILE_DIR(name)     (runtime_output_directory + "/Log/" + name)
 
 typedef fast_lio::msg::Pose6D Pose6D;
 typedef pcl::PointXYZINormal PointType;

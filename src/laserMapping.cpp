@@ -37,6 +37,9 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <stdexcept>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -84,7 +87,7 @@ double time_diff_lidar_to_imu = 0.0;
 mutex mtx_buffer;
 condition_variable sig_buffer;
 
-string root_dir = ROOT_DIR;
+std::string runtime_output_directory;
 string map_file_path, lid_topic, imu_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
@@ -151,8 +154,9 @@ void SigHandle(int sig)
     rclcpp::shutdown();
 }
 
-inline void dump_lio_state_to_log(FILE *fp)  
+inline void dump_lio_state_to_log(FILE *fp)
 {
+    if (!fp) return;
     V3D rot_ang(Log(state_point.rot.toRotationMatrix()));
     fprintf(fp, "%lf ", Measures.lidar_beg_time - first_lidar_time);
     fprintf(fp, "%lf %lf %lf ", rot_ang(0), rot_ang(1), rot_ang(2));                   // Angle
@@ -532,7 +536,7 @@ void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Share
         if (pcl_wait_save->size() > 0 && pcd_save_interval > 0  && scan_wait_num >= pcd_save_interval)
         {
             pcd_index ++;
-            string all_points_dir(string(string(ROOT_DIR) + "PCD/scans_") + to_string(pcd_index) + string(".pcd"));
+            string all_points_dir(runtime_output_directory + "/PCD/scans_" + to_string(pcd_index) + ".pcd");
             pcl::PCDWriter pcd_writer;
             cout << "current scan saved to /PCD/" << all_points_dir << endl;
             pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
@@ -608,8 +612,13 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
 
 void save_to_pcd()
 {
+    if (pcl_wait_pub->empty()) {
+        throw std::runtime_error("map is empty; enable publish.map_en and collect scans first");
+    }
     pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
+    if (pcd_writer.writeBinary(map_file_path, *pcl_wait_pub) != 0) {
+        throw std::runtime_error("failed to write map: " + map_file_path);
+    }
 }
 
 template<typename T>
@@ -806,6 +815,7 @@ public:
         this->declare_parameter<bool>("publish.scan_bodyframe_pub_en", true);
         this->declare_parameter<int>("max_iteration", 4);
         this->declare_parameter<string>("map_file_path", "");
+        this->declare_parameter<string>("output_directory", "");
         this->declare_parameter<string>("common.lid_topic", "/livox/lidar");
         this->declare_parameter<string>("common.imu_topic", "/livox/imu");
         this->declare_parameter<bool>("common.time_sync_en", false);
@@ -869,6 +879,31 @@ public:
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
+        this->get_parameter("output_directory", runtime_output_directory);
+        if (runtime_output_directory.empty()) {
+            const char *home = std::getenv("HOME");
+            if (home == nullptr || *home == '\0') {
+                throw std::runtime_error("output_directory is required when HOME is unavailable");
+            }
+            runtime_output_directory = std::string(home) + "/.local/share/fast_lio";
+        }
+        const auto output_path = std::filesystem::path(runtime_output_directory).lexically_normal();
+        if (!output_path.is_absolute() || output_path == output_path.root_path()) {
+            throw std::runtime_error("output_directory must be an absolute, non-root directory");
+        }
+        runtime_output_directory = output_path.string();
+        if (runtime_pos_log) std::filesystem::create_directories(output_path / "Log");
+        if (pcd_save_en) {
+            std::filesystem::create_directories(output_path / "PCD");
+            if (map_file_path.empty()) {
+                map_file_path = (output_path / "PCD/map.pcd").string();
+            }
+            const std::filesystem::path map_path(map_file_path);
+            if (!map_path.is_absolute() || map_path.filename().empty()) {
+                throw std::runtime_error("map_file_path must be an absolute file path");
+            }
+            std::filesystem::create_directories(map_path.parent_path());
+        }
 
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
@@ -903,19 +938,17 @@ public:
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
 
-        /*** debug record ***/
-        // FILE *fp;
-        string pos_log_dir = root_dir + "/Log/pos_log.txt";
-        fp = fopen(pos_log_dir.c_str(),"w");
-
-        // ofstream fout_pre, fout_out, fout_dbg;
-        fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"),ios::out);
-        fout_out.open(DEBUG_FILE_DIR("mat_out.txt"),ios::out);
-        fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"),ios::out);
-        if (fout_pre && fout_out)
-            cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
-        else
-            cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+        // Write diagnostics only when requested, outside the source checkout.
+        if (runtime_pos_log) {
+            fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), ios::out);
+            fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), ios::out);
+            fout_dbg.open(DEBUG_FILE_DIR("dbg.txt"), ios::out);
+            if (!fout_pre || !fout_out || !fout_dbg) {
+                throw std::runtime_error("cannot open diagnostic files under output_directory");
+            }
+            fp = fopen(DEBUG_FILE_DIR("pos_log.txt").c_str(), "w");
+            if (!fp) throw std::runtime_error("cannot open position log under output_directory");
+        }
 
         /*** ROS subscribe initialization ***/
         if (p_pre->lidar_type == AVIA)
@@ -951,7 +984,7 @@ public:
     {
         fout_out.close();
         fout_pre.close();
-        fclose(fp);
+        if (fp) fclose(fp);
     }
 
 private:
@@ -1028,8 +1061,13 @@ private:
             feats_down_world->resize(feats_down_size);
 
             V3D ext_euler = SO3ToEuler(state_point.offset_R_L_I);
-            fout_pre<<setw(20)<<Measures.lidar_beg_time - first_lidar_time<<" "<<euler_cur.transpose()<<" "<< state_point.pos.transpose()<<" "<<ext_euler.transpose() << " "<<state_point.offset_T_L_I.transpose()<< " " << state_point.vel.transpose() \
-            <<" "<<state_point.bg.transpose()<<" "<<state_point.ba.transpose()<<" "<<state_point.grav<< endl;
+            if (runtime_pos_log) {
+                fout_pre << setw(20) << Measures.lidar_beg_time - first_lidar_time
+                         << " " << euler_cur.transpose() << " " << state_point.pos.transpose()
+                         << " " << ext_euler.transpose() << " " << state_point.offset_T_L_I.transpose()
+                         << " " << state_point.vel.transpose() << " " << state_point.bg.transpose()
+                         << " " << state_point.ba.transpose() << " " << state_point.grav << endl;
+            }
 
             if(0) // If you need to see map point, change to "if(1)"
             {
@@ -1117,9 +1155,14 @@ private:
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
+            try {
+                save_to_pcd();
+                res->success = true;
+                res->message = "Map saved.";
+            } catch (const std::exception &error) {
+                res->success = false;
+                res->message = error.what();
+            }
         }
         else
         {
@@ -1150,7 +1193,7 @@ private:
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
 
-    FILE *fp;
+    FILE *fp = nullptr;
     ofstream fout_pre, fout_out, fout_dbg;
 };
 
@@ -1170,7 +1213,7 @@ int main(int argc, char** argv)
     if (pcl_wait_save->size() > 0 && pcd_save_en)
     {
         string file_name = string("scans.pcd");
-        string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
+        string all_points_dir(runtime_output_directory + "/PCD/" + file_name);
         pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name<<endl;
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
@@ -1180,8 +1223,12 @@ int main(int argc, char** argv)
     {
         vector<double> t, s_vec, s_vec2, s_vec3, s_vec4, s_vec5, s_vec6, s_vec7;    
         FILE *fp2;
-        string log_dir = root_dir + "/Log/fast_lio_time_log.csv";
+        string log_dir = DEBUG_FILE_DIR("fast_lio_time_log.csv");
         fp2 = fopen(log_dir.c_str(),"w");
+        if (!fp2) {
+            std::cerr << "Cannot open timing log: " << log_dir << std::endl;
+            return 1;
+        }
         fprintf(fp2,"time_stamp, total time, scan point size, incremental time, search time, delete size, delete time, tree size st, tree size end, add point size, preprocess time\n");
         for (int i = 0;i<time_log_counter; i++){
             fprintf(fp2,"%0.8f,%0.8f,%d,%0.8f,%0.8f,%d,%0.8f,%d,%d,%d,%0.8f\n",T1[i],s_plot[i],int(s_plot2[i]),s_plot3[i],s_plot4[i],int(s_plot5[i]),s_plot6[i],int(s_plot7[i]),int(s_plot8[i]), int(s_plot10[i]), s_plot11[i]);
